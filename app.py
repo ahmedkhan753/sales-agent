@@ -577,6 +577,470 @@ def call_external_ai(prompt: str, local_answer: str) -> str | None:
         )
 
 
+# ---------------------------------------------------------------------------
+# Prediction helpers
+# ---------------------------------------------------------------------------
+
+_PREDICTION_MENU_TRIGGERS = [
+    "i want to make a prediction",
+    "i want to predict",
+    "make a prediction",
+    "show prediction options",
+    "what can you predict",
+    "prediction options",
+    "i want to make a prediction from this data",
+]
+
+
+def _is_prediction_menu_trigger(prompt: str) -> bool:
+    """Return True if the prompt is a generic prediction trigger (Phase 1)."""
+    low = prompt.lower().strip()
+    if any(trigger in low for trigger in _PREDICTION_MENU_TRIGGERS):
+        return True
+    if low in ("predict", "prediction", "make prediction"):
+        return True
+    return False
+
+
+def _is_specific_prediction(prompt: str) -> bool:
+    """Return True if the prompt is a specific prediction request (Phase 2)."""
+    low = prompt.lower().strip()
+    if _is_prediction_menu_trigger(low):
+        return False
+    keywords = [
+        "predict", "forecast", "project", "estimate future",
+        "next month", "next quarter", "next year", "next week",
+        "trend", "will be", "going to be", "expected",
+        "classify", "which category", "what will",
+        "how much", "how many", "projection",
+    ]
+    return any(kw in low for kw in keywords)
+
+
+def _build_prediction_menu() -> str:
+    """Analyze the loaded dataset and return a tailored menu of prediction options."""
+    df = st.session_state.df_raw
+    profile = st.session_state.data_profile or {}
+    target_col = st.session_state.target_col
+
+    if df is None:
+        return "Please load a dataset first, then I can show you prediction options."
+
+    numeric_cols = [c for c in profile.get("numeric", []) if c != target_col]
+    categorical_cols = profile.get("categorical", [])
+
+    # Detect time/date columns
+    time_cols = [c for c in df.columns if pd.api.types.is_datetime64_any_dtype(df[c])]
+    if not time_cols:
+        time_cols = [
+            c for c in df.columns
+            if any(kw in c.lower() for kw in ["date", "time"])
+            and c in df.select_dtypes(include=["object", "datetime"]).columns
+        ]
+
+    options: list[str] = []
+
+    # Time-series forecasting options
+    if time_cols and numeric_cols:
+        for col in numeric_cols[:3]:
+            options.append(f"📈 Forecast **{col}** trends over time (time-series prediction)")
+
+    # Classification option
+    if target_col and target_col in df.columns:
+        classes = df[target_col].astype(str).value_counts().head(4).index.tolist()
+        classes_str = ", ".join(classes[:3])
+        if len(classes) > 3:
+            classes_str += ", ..."
+        options.append(
+            f"🏷️ Classify new records into **{target_col}** ({classes_str})"
+        )
+
+    # Numeric prediction options
+    for col in numeric_cols[:3]:
+        options.append(f"🔢 Predict **{col}** based on other features")
+
+    options.append(
+        "📊 **Custom prediction** — describe what you'd like to predict in your own words"
+    )
+
+    col_list = ", ".join(f"`{c}`" for c in list(df.columns)[:15])
+    if len(df.columns) > 15:
+        col_list += f", ... ({len(df.columns) - 15} more)"
+
+    menu = "Based on your loaded dataset, here are the predictions I can make:\n\n"
+    for i, opt in enumerate(options, 1):
+        menu += f"{i}. {opt}\n"
+    menu += (
+        f"\n**Available columns**: {col_list}\n\n"
+        "Just type what you'd like to predict — for example:\n"
+        "- *\"Forecast monthly net_sales for the next 3 months\"*\n"
+        "- *\"Which category will a new record fall into?\"*\n"
+        "- *\"Predict unit_price based on quantity and discount\"*\n"
+    )
+    return menu
+
+
+def build_prediction_context(prompt: str) -> str:
+    """Build comprehensive dataset context for the API prediction call."""
+    df = st.session_state.df_raw
+    profile = st.session_state.data_profile or {}
+    result = st.session_state.train_result or {}
+    target_col = st.session_state.target_col
+
+    parts: list[str] = [
+        "=== DATASET OVERVIEW ===",
+        f"Rows: {len(df):,}  |  Columns: {len(df.columns)}",
+        "Column names and types:",
+    ]
+
+    for col in df.columns:
+        dtype = str(df[col].dtype)
+        nunique = df[col].nunique()
+        null_pct = df[col].isna().mean() * 100
+        parts.append(f"  - {col} ({dtype}, {nunique} unique, {null_pct:.1f}% missing)")
+
+    # Numeric stats
+    num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+    if num_cols:
+        parts.append("\n=== NUMERIC STATISTICS ===")
+        stats = df[num_cols].describe().T
+        for col in list(stats.index)[:15]:
+            row = stats.loc[col]
+            parts.append(
+                f"  {col}: mean={row['mean']:.2f}, std={row['std']:.2f}, "
+                f"min={row['min']:.2f}, max={row['max']:.2f}"
+            )
+
+    # Target info
+    if target_col and target_col in df.columns:
+        parts.append(f"\n=== TARGET COLUMN: {target_col} ===")
+        dist = df[target_col].astype(str).value_counts().head(10)
+        for val, count in dist.items():
+            parts.append(f"  {val}: {count} ({count / len(df) * 100:.1f}%)")
+
+    # Time-series aggregation
+    date_cols = [c for c in df.columns if pd.api.types.is_datetime64_any_dtype(df[c])]
+    if date_cols:
+        date_col = date_cols[0]
+        parts.append(f"\n=== TIME SERIES ({date_col}) ===")
+        parts.append(f"Date range: {df[date_col].min()} to {df[date_col].max()}")
+        for nc in num_cols[:3]:
+            try:
+                monthly = df.set_index(date_col)[nc].resample("M").agg(["sum", "mean", "count"])
+                parts.append(f"\nMonthly {nc} (last 12 periods):")
+                for idx, row in monthly.tail(12).iterrows():
+                    parts.append(
+                        f"  {idx.strftime('%Y-%m')}: total={row['sum']:.0f}, "
+                        f"avg={row['mean']:.2f}, count={int(row['count'])}"
+                    )
+            except Exception:
+                pass
+
+    # Trained model info
+    if result:
+        parts.append("\n=== TRAINED MODEL INFO ===")
+        parts.append(f"Random Forest accuracy: {result.get('rf_accuracy', 0):.3f}")
+        parts.append(f"Decision Tree accuracy: {result.get('dt_accuracy', 0):.3f}")
+        parts.append(f"Number of reasoning rules: {result.get('n_rules', 0)}")
+
+    if Path("feature_importances.pkl").exists():
+        try:
+            imp = trainer.load_importances()["importances"]
+            ranked = sorted(imp.items(), key=lambda item: item[1], reverse=True)[:10]
+            parts.append("Top feature importances:")
+            for feat, score in ranked:
+                parts.append(f"  {feat}: {score:.4f}")
+        except Exception:
+            pass
+
+    # Sample data
+    parts.append("\n=== SAMPLE DATA (first 10 rows) ===")
+    parts.append(df.head(10).to_string(index=False))
+    if len(df) > 10:
+        parts.append("\n=== SAMPLE DATA (last 5 rows) ===")
+        parts.append(df.tail(5).to_string(index=False))
+
+    return "\n".join(parts)
+
+
+def call_prediction_ai(prompt: str) -> str | None:
+    """Dedicated API call for prediction requests with a specialised system prompt."""
+    provider = st.session_state.get("api_provider", "Offline ML")
+    if provider == "Offline ML":
+        return (
+            "⚠️ Prediction requires an AI provider. Please select a provider "
+            "(Groq, xAI Grok, OpenRouter, or Custom) in the sidebar and paste "
+            "your API key to enable intelligent predictions."
+        )
+
+    api_key = st.session_state.get("api_key") or os.getenv("AI_API_KEY", "")
+    base_url, model = provider_settings(
+        provider,
+        st.session_state.get("api_base_url", ""),
+        st.session_state.get("api_model", ""),
+    )
+    model = st.session_state.get("api_model") or model
+
+    if not api_key:
+        return (
+            f"⚠️ {provider} is selected but no API key is set. "
+            "Add the key in the sidebar, then try the prediction again."
+        )
+
+    if not base_url or not model:
+        return "The selected API provider is missing a base URL or model name."
+
+    prediction_context = build_prediction_context(prompt)
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are an expert data analyst and machine learning engineer. The user has "
+                "loaded a dataset and wants you to make a prediction or forecast based on it.\n\n"
+                "You have access to the full dataset context including statistics, sample rows, "
+                "column types, and trained model information.\n\n"
+                "Your response MUST include ALL of the following sections:\n\n"
+                "## 🎯 Prediction Result\n"
+                "The actual prediction with specific numbers, trends, or classifications. "
+                "Be concrete — use real values from the data.\n\n"
+                "## 📋 Prediction Strategy\n"
+                "Explain step-by-step HOW you arrived at the prediction. "
+                "What patterns, trends, or correlations did you find in the data?\n\n"
+                "## 🤖 Recommended ML Algorithm\n"
+                "State which ML algorithm is best suited for this prediction task "
+                "(e.g., Linear Regression, Random Forest, ARIMA, XGBoost, LSTM, Prophet, etc.) "
+                "and explain WHY it is the right choice for this data.\n\n"
+                "## 📊 Confidence & Caveats\n"
+                "Rate your confidence level and mention any limitations, assumptions, or "
+                "data gaps.\n\n"
+                "IMPORTANT: Be specific and data-driven. Reference actual numbers and column "
+                "names from the dataset. Do NOT give vague or generic advice — give actionable "
+                "predictions grounded in the provided data."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Prediction request:\n{prompt}\n\n"
+                f"Full dataset context:\n{prediction_context}"
+            ),
+        },
+    ]
+
+    try:
+        response = requests.post(
+            base_url,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "http://localhost:8501",
+                "X-Title": "Analyst ML Chatbot",
+            },
+            json={
+                "model": model,
+                "messages": messages,
+                "temperature": 0.3,
+                "max_tokens": 2500,
+            },
+            timeout=60,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        return payload["choices"][0]["message"]["content"].strip()
+    except Exception as exc:
+        return (
+            f"The {provider} prediction API call failed: {exc}\n\n"
+            "Please check your API key and network connection, then try again."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Missing-value analysis helper
+# ---------------------------------------------------------------------------
+
+def _analyze_missing_values() -> str:
+    """Build a comprehensive missing-value report with types and handling techniques."""
+    df = st.session_state.df_raw
+    if df is None:
+        return "No dataset loaded. Please upload data first."
+
+    total_cells = df.shape[0] * df.shape[1]
+    total_missing = int(df.isna().sum().sum())
+    overall_pct = (total_missing / total_cells * 100) if total_cells else 0
+
+    missing_series = df.isna().sum()
+    cols_with_missing = missing_series[missing_series > 0].sort_values(ascending=False)
+
+    if cols_with_missing.empty:
+        return (
+            "## \u2705 No Missing Values Detected\n\n"
+            f"Your dataset has **{df.shape[0]:,} rows** and **{df.shape[1]} columns** "
+            "with zero missing values. The data is complete and ready for analysis."
+        )
+
+    lines: list[str] = [
+        "## \U0001f50d Missing Value Analysis\n",
+        f"**Dataset**: {df.shape[0]:,} rows \u00d7 {df.shape[1]} columns "
+        f"| **Total missing cells**: {total_missing:,} ({overall_pct:.2f}%)\n",
+        f"**Columns affected**: {len(cols_with_missing)} out of {df.shape[1]}\n",
+        "---",
+        "",
+    ]
+
+    # Per-column analysis
+    lines.append("### Per-Column Breakdown\n")
+    lines.append("| Column | Type | Missing | % | Missingness Type | Recommended Technique |")
+    lines.append("|--------|------|---------|---|------------------|----------------------|")
+
+    technique_details: list[str] = []
+
+    for col, count in cols_with_missing.items():
+        pct = count / len(df) * 100
+        dtype = str(df[col].dtype)
+        is_numeric = pd.api.types.is_numeric_dtype(df[col])
+        is_datetime = pd.api.types.is_datetime64_any_dtype(df[col])
+        nunique = df[col].nunique(dropna=True)
+        nunique_ratio = nunique / len(df) if len(df) > 0 else 0
+
+        # Classify missingness type (heuristic)
+        if pct > 60:
+            miss_type = "\u26a0\ufe0f Structural"
+            miss_explain = "Extremely high missing rate suggests the column may not apply to all records"
+        elif pct > 30:
+            miss_type = "\U0001f534 Likely MNAR"
+            miss_explain = "Missing Not At Random \u2014 the absence likely depends on the value itself"
+        else:
+            # Check correlation with other columns having missing values
+            other_missing = df.drop(columns=[col]).isna().any(axis=1)
+            col_missing = df[col].isna()
+            if other_missing.sum() > 0:
+                overlap = (col_missing & other_missing).sum()
+                overlap_ratio = overlap / col_missing.sum() if col_missing.sum() > 0 else 0
+                if overlap_ratio > 0.6:
+                    miss_type = "\U0001f7e1 Likely MAR"
+                    miss_explain = "Missing At Random \u2014 missingness correlates with other columns"
+                else:
+                    miss_type = "\U0001f7e2 Likely MCAR"
+                    miss_explain = "Missing Completely At Random \u2014 no obvious pattern detected"
+            else:
+                miss_type = "\U0001f7e2 Likely MCAR"
+                miss_explain = "Missing Completely At Random \u2014 no obvious pattern detected"
+
+        # Determine handling technique
+        if pct > 60:
+            technique = "Drop column"
+            technique_long = (
+                f"**{col}** ({pct:.1f}% missing): **Drop this column**. "
+                "With over 60% missing data, imputation would introduce more noise than signal. "
+                "Use `df.drop(columns=['{col}'])`."
+            )
+        elif is_numeric and pct <= 5:
+            skew = df[col].skew() if df[col].notna().sum() > 2 else 0
+            if abs(skew) > 1:
+                technique = "Median imputation"
+                technique_long = (
+                    f"**{col}** ({pct:.1f}% missing, skewed distribution): **Median imputation**. "
+                    f"The data is skewed (skewness={skew:.2f}), so median is more robust than mean. "
+                    f"Use `df['{col}'].fillna(df['{col}'].median())`."
+                )
+            else:
+                technique = "Mean imputation"
+                technique_long = (
+                    f"**{col}** ({pct:.1f}% missing, ~normal distribution): **Mean imputation**. "
+                    f"Use `df['{col}'].fillna(df['{col}'].mean())`."
+                )
+        elif is_numeric and pct <= 30:
+            technique = "KNN / Iterative imputation"
+            technique_long = (
+                f"**{col}** ({pct:.1f}% missing): **KNN Imputer or Iterative Imputer**. "
+                "Moderate missingness in a numeric column benefits from model-based imputation. "
+                "Use `sklearn.impute.KNNImputer(n_neighbors=5)` or `IterativeImputer()`."
+            )
+        elif is_numeric:
+            technique = "Flag + Median"
+            technique_long = (
+                f"**{col}** ({pct:.1f}% missing): **Create a missing-indicator flag + median fill**. "
+                f"Add `df['{col}_was_missing'] = df['{col}'].isna().astype(int)` then fill with median. "
+                "The flag preserves the information that the value was missing."
+            )
+        elif is_datetime:
+            technique = "Forward/Backward fill"
+            technique_long = (
+                f"**{col}** ({pct:.1f}% missing): **Forward fill (ffill) or backward fill (bfill)**. "
+                f"Use `df['{col}'].fillna(method='ffill')` for time-series continuity."
+            )
+        elif nunique_ratio > 0.5:
+            technique = "Drop column (high cardinality)"
+            technique_long = (
+                f"**{col}** ({pct:.1f}% missing, {nunique} unique values): "
+                "**Consider dropping** \u2014 high-cardinality categorical columns with missing data "
+                "are difficult to impute meaningfully."
+            )
+        elif pct <= 10:
+            technique = "Mode imputation"
+            technique_long = (
+                f"**{col}** ({pct:.1f}% missing, categorical): **Mode (most frequent) imputation**. "
+                f"Use `df['{col}'].fillna(df['{col}'].mode()[0])`."
+            )
+        else:
+            technique = "Mode or 'Unknown'"
+            technique_long = (
+                f"**{col}** ({pct:.1f}% missing, categorical): **Fill with mode or a new category 'Unknown'**. "
+                f"Use `df['{col}'].fillna('Unknown')` to explicitly mark missing records."
+            )
+
+        col_type = "numeric" if is_numeric else ("datetime" if is_datetime else "categorical")
+        lines.append(f"| {col} | {col_type} | {count:,} | {pct:.1f}% | {miss_type} | {technique} |")
+        technique_details.append(technique_long)
+
+    # Missingness types explanation
+    lines.extend([
+        "",
+        "---",
+        "",
+        "### \U0001f4d6 Missing Value Types Explained\n",
+        "| Type | Meaning | Example |",
+        "|------|---------|--------|",
+        "| **MCAR** (Missing Completely At Random) | No pattern \u2014 missingness is purely random | Data entry errors, random sensor failures |",
+        "| **MAR** (Missing At Random) | Missingness depends on *other observed* columns | Income missing more often for younger respondents |",
+        "| **MNAR** (Missing Not At Random) | Missingness depends on the *missing value itself* | High earners skip income questions |",
+        "| **Structural** | Column doesn\u2019t apply to most records | \u2018Spouse name\u2019 missing for unmarried people |",
+    ])
+
+    # Detailed handling recommendations
+    lines.extend([
+        "",
+        "---",
+        "",
+        "### \U0001f6e0\ufe0f Recommended Handling Techniques\n",
+    ])
+    for detail in technique_details:
+        lines.append(f"- {detail}")
+
+    # Quick-apply summary
+    lines.extend([
+        "",
+        "---",
+        "",
+        "### \u26a1 Quick Summary\n",
+        f"- **Columns to consider dropping** (>60% missing): "
+        + (", ".join(f"`{c}`" for c, cnt in cols_with_missing.items() if cnt / len(df) > 0.6) or "None"),
+        f"- **Numeric columns to impute**: "
+        + (", ".join(
+            f"`{c}`" for c, cnt in cols_with_missing.items()
+            if pd.api.types.is_numeric_dtype(df[c]) and cnt / len(df) <= 0.6
+        ) or "None"),
+        f"- **Categorical columns to fill**: "
+        + (", ".join(
+            f"`{c}`" for c, cnt in cols_with_missing.items()
+            if not pd.api.types.is_numeric_dtype(df[c]) and cnt / len(df) <= 0.6
+        ) or "None"),
+    ])
+
+    return "\n".join(lines)
+
+
 def answer_without_data(prompt: str) -> str:
     return (
         "I can help as a data analyst right now, but I will become much sharper after you upload "
@@ -638,12 +1102,7 @@ def answer_with_data(prompt: str) -> str:
         )
 
     if any(word in low_prompt for word in ["missing", "null", "clean", "quality"]):
-        return (
-            "Data quality scan:\n\n"
-            f"{compact_table(profile.get('missing', {}), limit=10)}\n\n"
-            "Recommended next actions: impute numeric gaps with median values, fill categorical gaps "
-            "with the most common label or 'Unknown', and review high-cardinality ID columns before training."
-        )
+        return _analyze_missing_values()
 
     if any(word in low_prompt for word in ["important", "importance", "driver", "drivers", "influence"]):
         if train_result and Path("feature_importances.pkl").exists():
@@ -685,24 +1144,12 @@ def answer_with_data(prompt: str) -> str:
         except Exception as exc:
             return f"I tried to explain that outcome, but the model could not complete abduction: {exc}"
 
-    if any(word in low_prompt for word in ["predict", "classify", "if "]) and train_result:
-        facts = parse_facts(prompt, train_result["feature_names"])
-        if not facts:
-            example_features = ", ".join(train_result["feature_names"][:5])
-            return (
-                "I can predict from feature facts. Try a message like "
-                f"`predict if {example_features.split(', ')[0]}=10 and {example_features.split(', ')[-1]}=3`. "
-                "Use exact column names from your data."
-            )
-        results = reasoner.deduce(facts, top_k=3)
-        if not results:
-            return "No rule matched those facts. Try fewer fields or values closer to the training data."
-        top = results[0]
+    if any(word in low_prompt for word in ["predict", "classify", "forecast", "estimate"]):
+        if train_result:
+            return _build_prediction_menu()
         return (
-            f"Prediction: {top['prediction']} with {top['confidence']:.0%} rule confidence "
-            f"and {top['match_score']:.0%} fact match.\n\n"
-            "Supporting rule conditions:\n"
-            + "\n".join(f"- {condition}" for condition in top["conditions"][:8])
+            "I need a trained model before making predictions. "
+            "Load your data and click **Train agent** in the sidebar first."
         )
 
     numeric_cols = profile.get("numeric", [])
@@ -728,6 +1175,17 @@ def answer_with_data(prompt: str) -> str:
 
 
 def generate_response(prompt: str) -> str:
+    # Phase 1: Generic prediction trigger → show dataset-aware prediction menu
+    if st.session_state.df_raw is not None and _is_prediction_menu_trigger(prompt):
+        return _build_prediction_menu()
+
+    # Phase 2: Specific prediction request → specialised API call with rich context
+    if st.session_state.df_raw is not None and _is_specific_prediction(prompt):
+        result = call_prediction_ai(prompt)
+        if result:
+            return result
+
+    # Regular flow: local ML answer + optional external AI enhancement
     local_answer = answer_with_data(prompt)
     external_answer = call_external_ai(prompt, local_answer)
     return external_answer or local_answer
@@ -960,7 +1418,7 @@ pin_map = {
     "Top drivers": "What are the top drivers?",
     "Missing values": "Show missing values",
     "Why high?": "Why is the high outcome happening?",
-    "Predict": "Predict if quantity=5 and discount_pct=10",
+    "Predict": "I want to make a prediction from this data",
 }
 for idx, label in enumerate(pin_prompts):
     with pin_cols[idx]:
