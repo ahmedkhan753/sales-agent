@@ -1,54 +1,48 @@
 {
   "feature_names": [
-    "PREFIX",
-    "FIRST",
-    "LAST",
-    "MARITAL",
-    "RACE",
-    "ETHNICITY",
-    "GENDER",
-    "BIRTHPLACE",
-    "CITY",
-    "STATE",
-    "COUNTY",
-    "ZIP",
-    "LAT",
-    "LON"
+    "OrderID",
+    "Date",
+    "Gender",
+    "Age",
+    "Product",
+    "Quantity",
+    "Price",
+    "Total Amount"
   ],
   "class_names": [
     "high",
     "low",
     "medium"
   ],
-  "target_col": "ZIP_tier",
+  "target_col": "OrderID_tier",
   "tree_depth": 6,
   "accuracy": 1.0,
   "rules": [
     {
       "conditions": [
-        "ZIP <= 2128.5000"
+        "OrderID <= 329.0000"
       ],
       "prediction": "low",
       "confidence": 1.0,
-      "samples": 270
+      "samples": 264
     },
     {
       "conditions": [
-        "ZIP > 2128.5000",
-        "ZIP <= 2149.5000"
+        "OrderID > 329.0000",
+        "OrderID <= 669.5000"
       ],
       "prediction": "medium",
       "confidence": 1.0,
-      "samples": 266
+      "samples": 272
     },
     {
       "conditions": [
-        "ZIP > 2128.5000",
-        "ZIP > 2149.5000"
+        "OrderID > 329.0000",
+        "OrderID > 669.5000"
       ],
       "prediction": "high",
       "confidence": 1.0,
-      "samples": 243
+      "samples": 264
     }
   ]
 }
