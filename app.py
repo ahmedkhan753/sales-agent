@@ -17,7 +17,6 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-import requests
 import streamlit as st
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
@@ -26,9 +25,23 @@ import data_loader as dl
 import reasoner
 import trainer
 from abduction import try_bayesian_abduce
+from llm_explainer import explain_with_grok
 
 
 SAMPLE_ROWS = 10_000
+
+# Default Grok configuration — paste key here or set GROK_API_KEY env var
+DEFAULT_GROK_API_KEY = ""  # paste key here or set GROK_API_KEY env var
+DEFAULT_GROK_BASE_URL = "https://api.x.ai/v1/chat/completions"
+DEFAULT_GROK_MODEL = "grok-2-latest"
+
+LOCAL_PREDICTION_NOTE = (
+    "\n\n*Predictions are computed locally; explanation phrased by Grok.*"
+)
+
+
+def _resolve_grok_key() -> str:
+    return os.environ.get("GROK_API_KEY") or DEFAULT_GROK_API_KEY
 
 
 st.set_page_config(
@@ -286,10 +299,11 @@ def init_state() -> None:
         "text_vectors": None,
         "text_vectorizer": None,
         "data_profile": None,
-        "api_provider": "Offline ML",
-        "api_key": "",
-        "api_model": "",
-        "api_base_url": "",
+        "cleaning_report": None,
+        "api_provider": "xAI Grok",
+        "api_key": _resolve_grok_key(),
+        "api_model": DEFAULT_GROK_MODEL,
+        "api_base_url": DEFAULT_GROK_BASE_URL,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -477,106 +491,6 @@ def provider_settings(provider: str, custom_base_url: str, custom_model: str) ->
     return presets.get(provider, ("", ""))
 
 
-def dataset_context_for_llm(prompt: str) -> str:
-    profile = st.session_state.data_profile or {}
-    result = st.session_state.train_result or {}
-    context = [
-        f"Rows: {profile.get('rows', 0)}",
-        f"Columns: {profile.get('columns', 0)}",
-        f"Target: {st.session_state.target_col or 'none'}",
-        f"Numeric columns: {', '.join(profile.get('numeric', [])[:30])}",
-        f"Categorical/text columns: {', '.join(profile.get('categorical', [])[:30])}",
-        f"Target distribution: {profile.get('target_distribution', {})}",
-        f"Missing values: {profile.get('missing', {})}",
-    ]
-
-    if result:
-        context.append(f"Random Forest accuracy: {result.get('rf_accuracy', 0):.3f}")
-        context.append(f"Decision Tree accuracy: {result.get('dt_accuracy', 0):.3f}")
-
-    if Path("feature_importances.pkl").exists():
-        try:
-            imp = trainer.load_importances()["importances"]
-            ranked = sorted(imp.items(), key=lambda item: item[1], reverse=True)[:12]
-            context.append(f"Top feature importances: {ranked}")
-        except Exception:
-            pass
-
-    retrieval = answer_with_text_retrieval(prompt)
-    if retrieval:
-        context.append(f"Relevant text evidence:\n{retrieval}")
-
-    if st.session_state.df_raw is not None:
-        preview = st.session_state.df_raw.head(8).to_dict("records")
-        context.append(f"Data preview: {preview}")
-
-    return "\n".join(context)
-
-
-def call_external_ai(prompt: str, local_answer: str) -> str | None:
-    provider = st.session_state.get("api_provider", "Offline ML")
-    if provider == "Offline ML":
-        return None
-
-    api_key = st.session_state.get("api_key") or os.getenv("AI_API_KEY", "")
-    base_url, model = provider_settings(
-        provider,
-        st.session_state.get("api_base_url", ""),
-        st.session_state.get("api_model", ""),
-    )
-    model = st.session_state.get("api_model") or model
-
-    if not api_key:
-        return (
-            f"{provider} is selected, but no API key is set. Add the key in the sidebar "
-            "or set AI_API_KEY, then ask again.\n\nLocal ML answer:\n"
-            f"{local_answer}"
-        )
-
-    if not base_url or not model:
-        return "The selected API provider is missing a base URL or model name."
-
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are a senior data analyst chatbot. Answer conversationally and directly. "
-                "Use the provided dataset context, local ML result, and evidence. If the data does "
-                "not support a claim, say so. Keep answers useful, not generic."
-            ),
-        },
-        {
-            "role": "user",
-            "content": (
-                f"User question:\n{prompt}\n\n"
-                f"Dataset context:\n{dataset_context_for_llm(prompt)}\n\n"
-                f"Local ML/statistical answer to improve:\n{local_answer}"
-            ),
-        },
-    ]
-
-    try:
-        response = requests.post(
-            base_url,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-                "HTTP-Referer": "http://localhost:8501",
-                "X-Title": "Analyst ML Chatbot",
-            },
-            json={"model": model, "messages": messages, "temperature": 0.35, "max_tokens": 900},
-            timeout=45,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        return payload["choices"][0]["message"]["content"].strip()
-    except Exception as exc:
-        return (
-            f"The {provider} API call failed: {exc}\n\n"
-            f"Local ML answer:\n{local_answer}"
-        )
-
-
 # ---------------------------------------------------------------------------
 # Prediction helpers
 # ---------------------------------------------------------------------------
@@ -680,179 +594,87 @@ def _build_prediction_menu() -> str:
     return menu
 
 
-def build_prediction_context(prompt: str) -> str:
-    """Build comprehensive dataset context for the API prediction call."""
-    df = st.session_state.df_raw
-    profile = st.session_state.data_profile or {}
-    result = st.session_state.train_result or {}
-    target_col = st.session_state.target_col
-
-    parts: list[str] = [
-        "=== DATASET OVERVIEW ===",
-        f"Rows: {len(df):,}  |  Columns: {len(df.columns)}",
-        "Column names and types:",
-    ]
-
-    for col in df.columns:
-        dtype = str(df[col].dtype)
-        nunique = df[col].nunique()
-        null_pct = df[col].isna().mean() * 100
-        parts.append(f"  - {col} ({dtype}, {nunique} unique, {null_pct:.1f}% missing)")
-
-    # Numeric stats
-    num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-    if num_cols:
-        parts.append("\n=== NUMERIC STATISTICS ===")
-        stats = df[num_cols].describe().T
-        for col in list(stats.index)[:15]:
-            row = stats.loc[col]
-            parts.append(
-                f"  {col}: mean={row['mean']:.2f}, std={row['std']:.2f}, "
-                f"min={row['min']:.2f}, max={row['max']:.2f}"
-            )
-
-    # Target info
-    if target_col and target_col in df.columns:
-        parts.append(f"\n=== TARGET COLUMN: {target_col} ===")
-        dist = df[target_col].astype(str).value_counts().head(10)
-        for val, count in dist.items():
-            parts.append(f"  {val}: {count} ({count / len(df) * 100:.1f}%)")
-
-    # Time-series aggregation
-    date_cols = [c for c in df.columns if pd.api.types.is_datetime64_any_dtype(df[c])]
-    if date_cols:
-        date_col = date_cols[0]
-        parts.append(f"\n=== TIME SERIES ({date_col}) ===")
-        parts.append(f"Date range: {df[date_col].min()} to {df[date_col].max()}")
-        for nc in num_cols[:3]:
-            try:
-                monthly = df.set_index(date_col)[nc].resample("M").agg(["sum", "mean", "count"])
-                parts.append(f"\nMonthly {nc} (last 12 periods):")
-                for idx, row in monthly.tail(12).iterrows():
-                    parts.append(
-                        f"  {idx.strftime('%Y-%m')}: total={row['sum']:.0f}, "
-                        f"avg={row['mean']:.2f}, count={int(row['count'])}"
-                    )
-            except Exception:
-                pass
-
-    # Trained model info
-    if result:
-        parts.append("\n=== TRAINED MODEL INFO ===")
-        parts.append(f"Random Forest accuracy: {result.get('rf_accuracy', 0):.3f}")
-        parts.append(f"Decision Tree accuracy: {result.get('dt_accuracy', 0):.3f}")
-        parts.append(f"Number of reasoning rules: {result.get('n_rules', 0)}")
-
-    if Path("feature_importances.pkl").exists():
-        try:
-            imp = trainer.load_importances()["importances"]
-            ranked = sorted(imp.items(), key=lambda item: item[1], reverse=True)[:10]
-            parts.append("Top feature importances:")
-            for feat, score in ranked:
-                parts.append(f"  {feat}: {score:.4f}")
-        except Exception:
-            pass
-
-    # Sample data
-    parts.append("\n=== SAMPLE DATA (first 10 rows) ===")
-    parts.append(df.head(10).to_string(index=False))
-    if len(df) > 10:
-        parts.append("\n=== SAMPLE DATA (last 5 rows) ===")
-        parts.append(df.tail(5).to_string(index=False))
-
-    return "\n".join(parts)
-
-
-def call_prediction_ai(prompt: str) -> str | None:
-    """Dedicated API call for prediction requests with a specialised system prompt."""
-    provider = st.session_state.get("api_provider", "Offline ML")
-    if provider == "Offline ML":
-        return (
-            "⚠️ Prediction requires an AI provider. Please select a provider "
-            "(Groq, xAI Grok, OpenRouter, or Custom) in the sidebar and paste "
-            "your API key to enable intelligent predictions."
-        )
-
-    api_key = st.session_state.get("api_key") or os.getenv("AI_API_KEY", "")
-    base_url, model = provider_settings(
-        provider,
-        st.session_state.get("api_base_url", ""),
-        st.session_state.get("api_model", ""),
-    )
-    model = st.session_state.get("api_model") or model
-
-    if not api_key:
-        return (
-            f"⚠️ {provider} is selected but no API key is set. "
-            "Add the key in the sidebar, then try the prediction again."
-        )
-
-    if not base_url or not model:
-        return "The selected API provider is missing a base URL or model name."
-
-    prediction_context = build_prediction_context(prompt)
-
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are an expert data analyst and machine learning engineer. The user has "
-                "loaded a dataset and wants you to make a prediction or forecast based on it.\n\n"
-                "You have access to the full dataset context including statistics, sample rows, "
-                "column types, and trained model information.\n\n"
-                "Your response MUST include ALL of the following sections:\n\n"
-                "## 🎯 Prediction Result\n"
-                "The actual prediction with specific numbers, trends, or classifications. "
-                "Be concrete — use real values from the data.\n\n"
-                "## 📋 Prediction Strategy\n"
-                "Explain step-by-step HOW you arrived at the prediction. "
-                "What patterns, trends, or correlations did you find in the data?\n\n"
-                "## 🤖 Recommended ML Algorithm\n"
-                "State which ML algorithm is best suited for this prediction task "
-                "(e.g., Linear Regression, Random Forest, ARIMA, XGBoost, LSTM, Prophet, etc.) "
-                "and explain WHY it is the right choice for this data.\n\n"
-                "## 📊 Confidence & Caveats\n"
-                "Rate your confidence level and mention any limitations, assumptions, or "
-                "data gaps.\n\n"
-                "IMPORTANT: Be specific and data-driven. Reference actual numbers and column "
-                "names from the dataset. Do NOT give vague or generic advice — give actionable "
-                "predictions grounded in the provided data."
-            ),
-        },
-        {
-            "role": "user",
-            "content": (
-                f"Prediction request:\n{prompt}\n\n"
-                f"Full dataset context:\n{prediction_context}"
-            ),
-        },
-    ]
+def predict_locally(prompt: str) -> dict:
+    """
+    Run the locally-trained scikit-learn models against facts parsed from the
+    prompt and return a structured dict of REAL numbers. No LLM is involved.
+    """
+    if not st.session_state.train_result:
+        return {"error": "I need a trained model before making predictions. Click **Train agent** in the sidebar first."}
 
     try:
-        response = requests.post(
-            base_url,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-                "HTTP-Referer": "http://localhost:8501",
-                "X-Title": "Analyst ML Chatbot",
-            },
-            json={
-                "model": model,
-                "messages": messages,
-                "temperature": 0.3,
-                "max_tokens": 2500,
-            },
-            timeout=60,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        return payload["choices"][0]["message"]["content"].strip()
+        models = trainer.load_models()
+        rules_payload = trainer.load_rules()
+        importance_payload = trainer.load_importances()
+    except FileNotFoundError as exc:
+        return {"error": f"Trained artifacts are missing on disk: {exc}"}
+
+    rf = models["rf"]
+    le = models["le"]
+    feature_names = rules_payload["feature_names"]
+
+    df_clean = st.session_state.df_clean
+    if df_clean is None:
+        return {"error": "Cleaned dataset is not in session state — retrain to refresh."}
+
+    missing_cols = [f for f in feature_names if f not in df_clean.columns]
+    if missing_cols:
+        return {"error": f"Cleaned data is missing trained feature columns: {missing_cols}"}
+
+    facts = parse_facts(prompt, feature_names)
+
+    medians = df_clean[feature_names].median(numeric_only=True)
+    row: list[float] = []
+    for feat in feature_names:
+        if feat in facts:
+            try:
+                row.append(float(facts[feat]))
+                continue
+            except (ValueError, TypeError):
+                pass
+        row.append(float(medians.get(feat, 0.0)))
+
+    X = np.array(row, dtype=float).reshape(1, -1)
+    try:
+        pred_encoded = int(rf.predict(X)[0])
+        pred_label = str(le.inverse_transform([pred_encoded])[0])
+        proba = rf.predict_proba(X)[0]
+        confidence = float(proba[pred_encoded])
     except Exception as exc:
-        return (
-            f"The {provider} prediction API call failed: {exc}\n\n"
-            "Please check your API key and network connection, then try again."
-        )
+        return {"error": f"Local model prediction failed: {exc}"}
+
+    matched_rules = reasoner.deduce(facts, top_k=3) if facts else []
+    importances_ranked = sorted(
+        importance_payload["importances"].items(), key=lambda kv: kv[1], reverse=True
+    )[:5]
+
+    return {
+        "task_type": "classification",
+        "prediction": pred_label,
+        "prediction_confidence": round(confidence, 4),
+        "dt_accuracy": rules_payload.get("accuracy"),
+        "rf_accuracy": importance_payload.get("rf_accuracy"),
+        "facts_used": facts,
+        "feature_vector": {feat: row[i] for i, feat in enumerate(feature_names)},
+        "top_importances": importances_ranked,
+        "matched_rules": matched_rules,
+    }
+
+
+def _format_prediction_response(model_output: dict, explanation: str) -> str:
+    facts = model_output.get("facts_used") or {}
+    facts_str = (
+        ", ".join(f"`{k}={v}`" for k, v in facts.items())
+        if facts
+        else "median values for all features (no specific facts supplied)"
+    )
+    header_lines = [
+        "### Local prediction",
+        f"- **Predicted {model_output.get('task_type', 'class')}:** `{model_output['prediction']}`",
+        f"- **Confidence:** {model_output['prediction_confidence']:.1%}",
+        f"- **Inputs used:** {facts_str}",
+    ]
+    return "\n".join(header_lines) + "\n\n### Explanation\n" + explanation + LOCAL_PREDICTION_NOTE
 
 
 # ---------------------------------------------------------------------------
@@ -1179,22 +1001,29 @@ def generate_response(prompt: str) -> str:
     if st.session_state.df_raw is not None and _is_prediction_menu_trigger(prompt):
         return _build_prediction_menu()
 
-    # Phase 2: Specific prediction request → specialised API call with rich context
+    # Phase 2: Specific prediction request → LOCAL model produces the prediction,
+    # Grok (if configured) only narrates the resulting numbers.
     if st.session_state.df_raw is not None and _is_specific_prediction(prompt):
-        result = call_prediction_ai(prompt)
-        if result:
-            return result
+        model_output = predict_locally(prompt)
+        if "error" in model_output:
+            return model_output["error"]
 
-    # Regular flow: local ML answer + optional external AI enhancement
-    local_answer = answer_with_data(prompt)
-    external_answer = call_external_ai(prompt, local_answer)
-    return external_answer or local_answer
+        explanation = explain_with_grok(
+            model_output,
+            api_key=st.session_state.get("api_key") or _resolve_grok_key(),
+            base_url=st.session_state.get("api_base_url") or DEFAULT_GROK_BASE_URL,
+            model=st.session_state.get("api_model") or DEFAULT_GROK_MODEL,
+        )
+        return _format_prediction_response(model_output, explanation)
+
+    # All other questions are answered from local data only — no LLM enhancement.
+    return answer_with_data(prompt)
 
 
 def train_agent(df: pd.DataFrame, target_request: str, tree_depth: int, n_estimators: int) -> None:
     target_col = detect_target(df, target_request.strip() or None)
     model_df = ensure_target(df, target_col)
-    clean_df = dl.clean_data(model_df, target_col=target_col)
+    clean_df, cleaning_report = dl.clean_data(model_df, target_col=target_col)
 
     if clean_df[target_col].nunique(dropna=True) < 2:
         raise ValueError("The target has fewer than two classes after cleaning.")
@@ -1216,6 +1045,7 @@ def train_agent(df: pd.DataFrame, target_request: str, tree_depth: int, n_estima
     st.session_state.text_vectorizer = vectorizer
     st.session_state.text_vectors = vectors
     st.session_state.data_profile = profile_data(model_df, target_col)
+    st.session_state.cleaning_report = cleaning_report
 
     st.session_state.chat.append(
         {
@@ -1437,7 +1267,7 @@ st.markdown("</div>", unsafe_allow_html=True)
 
 if st.session_state.df_raw is not None:
     with st.expander("Data and model details", expanded=False):
-        tabs = st.tabs(["Preview", "Drivers", "Profile"])
+        tabs = st.tabs(["Preview", "Drivers", "Profile", "Cleaning"])
         with tabs[0]:
             st.dataframe(st.session_state.df_raw.head(30), use_container_width=True, height=360)
         with tabs[1]:
@@ -1452,3 +1282,13 @@ if st.session_state.df_raw is not None:
                 st.info("Train the model to see drivers.")
         with tabs[2]:
             st.json(st.session_state.data_profile or {})
+        with tabs[3]:
+            report = st.session_state.get("cleaning_report")
+            if report:
+                st.caption(
+                    "Audit trail of every action `data_loader.clean_data` performed. "
+                    "No LLM was involved in preparing this data."
+                )
+                st.json(report)
+            else:
+                st.info("Train the model to see the cleaning report.")

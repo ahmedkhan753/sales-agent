@@ -184,62 +184,128 @@ def load_data(source) -> pd.DataFrame:
 # Cleaning & preprocessing
 # ---------------------------------------------------------------------------
 
-def clean_data(df: pd.DataFrame, target_col: str = "sales_category") -> pd.DataFrame:
+def clean_data(
+    df: pd.DataFrame,
+    target_col: str = "sales_category",
+    max_categorical_cardinality: int = 50,
+) -> tuple[pd.DataFrame, dict]:
     """
     Clean and preprocess a DataFrame for training.
 
     Steps
     -----
     1. Drop columns with >60 % missing values.
-    2. Impute numeric NaNs with median; categorical NaNs with mode.
-    3. Parse date columns and extract year/month/day_of_week features.
-    4. Create ``sales_category`` target if a numeric ``net_sales``/``sales``
-       column exists and target is absent.
-    5. Encode categoricals as integer codes (stored in mapping dict).
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Raw DataFrame.
-    target_col : str
-        Name of the target column (default ``sales_category``).
+    2. Drop ID-like object columns (>90 % unique).
+    3. Coerce object columns that are actually numeric (e.g. "1,234", "12%",
+       "$5") when >=80 % of non-null values parse as numbers.
+    4. Parse date columns and extract year/month/day_of_week features.
+    5. Drop high-cardinality categoricals beyond ``max_categorical_cardinality``.
+    6. Create ``target_col`` if absent (tertile cut on a numeric sales-like column).
+    7. Impute numeric NaNs with median; categorical NaNs with mode.
+    8. Encode remaining categoricals as integer codes.
 
     Returns
     -------
-    pd.DataFrame
-        Cleaned DataFrame ready for ML.
+    tuple[pd.DataFrame, dict]
+        The cleaned DataFrame, plus a ``cleaning_report`` describing every
+        action taken (dropped columns + reason, imputations, encodings, target
+        source). The report is the audit trail proving no LLM touched the data.
     """
     df = df.copy()
+    report: dict = {
+        "dropped_columns": [],
+        "coerced_numeric": [],
+        "imputed_columns": [],
+        "encoded_columns": [],
+        "target_source": None,
+        "max_categorical_cardinality": max_categorical_cardinality,
+    }
+    n_rows = len(df)
 
-    # Drop near-empty columns
-    threshold = 0.6 * len(df)
-    df = df.dropna(axis=1, thresh=int(len(df) - threshold))
-
-    # Drop ID-like columns (unique ratio > 90 %)
-    for col in df.select_dtypes(include="object").columns:
-        if df[col].nunique() / len(df) > 0.9:
+    # 1. Drop near-empty columns (>60 % missing)
+    for col in list(df.columns):
+        na_count = int(df[col].isna().sum())
+        if n_rows and na_count > 0.6 * n_rows:
+            report["dropped_columns"].append(
+                {"column": col, "reason": f">60% missing ({na_count}/{n_rows} NA)"}
+            )
             df = df.drop(columns=[col])
 
-    # Parse date columns
-    for col in df.select_dtypes(include="object").columns:
+    # 2. Drop ID-like object columns (>90 % unique)
+    for col in list(df.select_dtypes(include="object").columns):
+        unique_ratio = df[col].nunique() / n_rows if n_rows else 0
+        if unique_ratio > 0.9:
+            report["dropped_columns"].append(
+                {"column": col, "reason": f"ID-like ({unique_ratio:.0%} unique)"}
+            )
+            df = df.drop(columns=[col])
+
+    # 3. Coerce object columns that are actually numeric ("1,234", "12%", "$5")
+    for col in list(df.select_dtypes(include="object").columns):
+        if col == target_col:
+            continue
+        non_null = df[col].dropna().astype(str)
+        if non_null.empty:
+            continue
+        cleaned = (
+            non_null.str.replace(r"[$,]", "", regex=True)
+            .str.replace("%", "", regex=False)
+            .str.strip()
+        )
+        coerced = pd.to_numeric(cleaned, errors="coerce")
+        parse_rate = coerced.notna().sum() / len(non_null)
+        if parse_rate >= 0.8:
+            full_cleaned = (
+                df[col].astype(str)
+                .str.replace(r"[$,]", "", regex=True)
+                .str.replace("%", "", regex=False)
+                .str.strip()
+            )
+            df[col] = pd.to_numeric(full_cleaned, errors="coerce")
+            report["coerced_numeric"].append(
+                {"column": col, "parse_rate": round(float(parse_rate), 3)}
+            )
+
+    # 4. Parse date-like object columns into year/month/dow features
+    for col in list(df.select_dtypes(include="object").columns):
         if "date" in col.lower() or "time" in col.lower():
             try:
                 parsed = pd.to_datetime(df[col], infer_datetime_format=True, errors="coerce")
-                if parsed.notna().sum() > len(df) * 0.5:
+                if parsed.notna().sum() > n_rows * 0.5:
                     df[col + "_year"] = parsed.dt.year
                     df[col + "_month"] = parsed.dt.month
                     df[col + "_dow"] = parsed.dt.dayofweek
                     df = df.drop(columns=[col])
+                    report["dropped_columns"].append(
+                        {"column": col, "reason": "date column, expanded to year/month/dow"}
+                    )
             except Exception:
                 pass
 
-    for col in df.select_dtypes(include=["datetime64"]):
+    for col in list(df.select_dtypes(include=["datetime64"])):
         df[col + "_year"] = df[col].dt.year
         df[col + "_month"] = df[col].dt.month
         df[col + "_dow"] = df[col].dt.dayofweek
         df = df.drop(columns=[col])
+        report["dropped_columns"].append(
+            {"column": col, "reason": "datetime column, expanded to year/month/dow"}
+        )
 
-    # Create target if absent
+    # 5. Drop high-cardinality categoricals beyond the configured threshold
+    for col in list(df.select_dtypes(include="object").columns):
+        if col == target_col:
+            continue
+        n_unique = int(df[col].nunique())
+        if n_unique > max_categorical_cardinality:
+            report["dropped_columns"].append(
+                {
+                    "column": col,
+                    "reason": f"high cardinality ({n_unique} > {max_categorical_cardinality})",
+                }
+            )
+            df = df.drop(columns=[col])
+
+    # 6. Create target if absent
     if target_col not in df.columns:
         numeric_candidates = [c for c in ["net_sales", "sales", "revenue", "amount"] if c in df.columns]
         if numeric_candidates:
@@ -251,21 +317,35 @@ def clean_data(df: pd.DataFrame, target_col: str = "sales_category") -> pd.DataF
                 bins=[-np.inf, low_q, high_q, np.inf],
                 labels=["low", "medium", "high"],
             ).astype(str)
+            report["target_source"] = f"derived from `{sales_col}` via tertile cut"
 
-    # Impute
+    # 7. Impute
     for col in df.select_dtypes(include="number").columns:
-        df[col] = df[col].fillna(df[col].median())
+        if df[col].isna().any():
+            median_val = df[col].median()
+            df[col] = df[col].fillna(median_val)
+            report["imputed_columns"].append(
+                {"column": col, "method": "median", "fill_value": float(median_val)}
+            )
 
     for col in df.select_dtypes(include="object").columns:
-        df[col] = df[col].fillna(df[col].mode().iloc[0] if not df[col].mode().empty else "Unknown")
+        if df[col].isna().any():
+            mode_series = df[col].mode()
+            mode_val = mode_series.iloc[0] if not mode_series.empty else "Unknown"
+            df[col] = df[col].fillna(mode_val)
+            report["imputed_columns"].append(
+                {"column": col, "method": "mode", "fill_value": str(mode_val)}
+            )
 
-    # Encode categoricals
+    # 8. Encode remaining categoricals
     for col in df.select_dtypes(include="object").columns:
         if col == target_col:
             continue
+        n_cats = int(df[col].nunique())
         df[col] = df[col].astype("category").cat.codes
+        report["encoded_columns"].append({"column": col, "n_categories": n_cats})
 
-    return df
+    return df, report
 
 
 def infer_column_types(df: pd.DataFrame) -> dict:
